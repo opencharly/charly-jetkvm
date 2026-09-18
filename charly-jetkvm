@@ -52,6 +52,7 @@ Usage:
   charly-jetkvm status    --host <ssh-target> [--prefix <path>]
   charly-jetkvm verify    --host <ssh-target> [--prefix <path>]
   charly-jetkvm uninstall --host <ssh-target> [--prefix <path>] [--yes]
+  charly-jetkvm env       --host <ssh-target> [--export] [--device-host <name>]
 
 Common flags:
   --host <target>    ssh(1) destination (alias, or user@host[:port]). Required.
@@ -69,8 +70,22 @@ Common flags:
                      into a thrashing system is how a prior attempt hung it.
   --yes              do not prompt for the uninstall confirmation.
 
+`env` flags:
+  --device-host <name>  JETKVM_HOST value to print (default: the ssh target's
+                        host part). Use when the device is reached by tailnet
+                        name or IP that differs from the ssh target.
+  --export              print `export JETKVM_...=...` lines instead of plain
+                        KEY=VALUE, for `eval "$(charly-jetkvm env ...)"`.
+
+`env` reads the device's /userdata/kvm_config.json OVER SSH (root) and prints
+JETKVM_HOST + JETKVM_AUTH_TOKEN, so a `jetkvm:` plan can be driven from the ssh
+connection alone with no committed hostname or token:
+  eval "$(charly-jetkvm env --host root@jk.example.ts.net --export)"
+  charly check run jetkvm-device-readonly
+
 Environment:
   CHARLY_JETKVM_GH   gh(1) binary to use (default: gh).
+  CHARLY_JETKVM_CONFIG  device config path (default /userdata/kvm_config.json).
 EOF
 }
 
@@ -82,7 +97,10 @@ PREFIX=/userdata/charly
 ARCH=
 MIN_FREE_MB=120
 ASSUME_YES=0
+DEVICE_HOST=
+EXPORT=0
 GH=${CHARLY_JETKVM_GH:-gh}
+CONFIG_PATH=${CHARLY_JETKVM_CONFIG:-/userdata/kvm_config.json}
 SSH_ARG_LIST=$(mktemp "${TMPDIR:-/tmp}/charly-jetkvm.ssh.XXXXXX")
 trap 'rm -f "$SSH_ARG_LIST"' EXIT INT TERM
 
@@ -100,6 +118,8 @@ while [ $# -gt 0 ]; do
         --arch)        ARCH=${2:?--arch needs a value}; shift 2 ;;
         --ssh-arg)     printf '%s\n' "${2:?--ssh-arg needs a value}" >> "$SSH_ARG_LIST"; shift 2 ;;
         --min-free-mb) MIN_FREE_MB=${2:?--min-free-mb needs a value}; shift 2 ;;
+        --device-host) DEVICE_HOST=${2:?--device-host needs a value}; shift 2 ;;
+        --export)      EXPORT=1; shift ;;
         --yes)         ASSUME_YES=1; shift ;;
         -h|--help)     usage; exit 0 ;;
         *)             die "unknown argument: $1" ;;
@@ -110,8 +130,8 @@ done
 command -v "$GH" >/dev/null 2>&1 || die "$GH not found (needed to fetch release assets)"
 
 case "$ACTION" in
-    install|status|verify|uninstall) ;;
-    *) die "unknown action '$ACTION' (want install|status|verify|uninstall)" ;;
+    install|status|verify|uninstall|env) ;;
+    *) die "unknown action '$ACTION' (want install|status|verify|uninstall|env)" ;;
 esac
 
 # --- remote helpers ---------------------------------------------------------
@@ -252,9 +272,43 @@ do_uninstall() {
     info "removed $PREFIX on $HOST"
 }
 
+# --- env --------------------------------------------------------------------
+# Prints JETKVM_HOST + JETKVM_AUTH_TOKEN derived from the device OVER SSH, so a
+# `jetkvm:` plan can be driven from the ssh connection ALONE — no committed
+# hostname, no manually-copied token. The token is the device's local_auth_token
+# from kvm_config.json (the same value a browser session cookie carries); it is
+# read with a root ssh command and printed to stdout, never written to a file by
+# this tool.
+do_env() {
+    dh="$DEVICE_HOST"
+    if [ -z "$dh" ]; then
+        # Default to the host part of the ssh target (strip user@ and :port).
+        dh="${HOST##*@}"
+        dh="${dh%%:*}"
+    fi
+    [ -n "$dh" ] || die "cannot determine device host; pass --device-host"
+
+    token=$(rsh "sed -n 's/.*\"local_auth_token\": *\"\\([^\"]*\\)\".*/\\1/p' '$CONFIG_PATH' 2>/dev/null" || true)
+    [ -n "$token" ] || die "could not read local_auth_token from $CONFIG_PATH on $HOST (is it a JetKVM, and are you root?)"
+
+    if [ "$EXPORT" -eq 1 ]; then
+        printf 'export JETKVM_HOST=%s\n' "$(shquote "$dh")"
+        printf 'export JETKVM_AUTH_TOKEN=%s\n' "$(shquote "$token")"
+    else
+        printf 'JETKVM_HOST=%s\n' "$dh"
+        printf 'JETKVM_AUTH_TOKEN=%s\n' "$token"
+    fi
+}
+
+# shquote single-quotes a value for safe re-evaluation.
+shquote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 case "$ACTION" in
     install)   do_install ;;
     verify)    do_verify ;;
     status)    do_status ;;
     uninstall) do_uninstall ;;
+    env)       do_env ;;
 esac
