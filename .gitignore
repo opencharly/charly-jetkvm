@@ -1,0 +1,4 @@
+# charly-jetkvm local artifacts
+/bin/
+/tests/tmp/
+*.log

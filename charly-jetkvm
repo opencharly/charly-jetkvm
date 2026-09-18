@@ -1,0 +1,260 @@
+#!/bin/sh
+# shellcheck disable=SC2016,SC2029
+# (SC2016/SC2029) Remote commands handed to `ssh "$HOST" '...'` are LITERAL: the
+# `$`, `\` and `$@` inside them expand on the REMOTE side. The linter cannot see
+# across the ssh boundary, so both checks are disabled for the file.
+# charly-jetkvm — provision the appliance-resident charly on a JetKVM.
+#
+# A JetKVM is a 32-bit ARM (armv7l) appliance with a uClibc/BusyBox userland and
+# NO package manager, so the distro packages cannot be installed on it. This
+# tool instead delivers the published `charly` release binary plus its welded
+# plugin set (per-plugin armv7 binaries, as the release ships them) over the
+# authenticated ssh channel and verifies they run project-less on the device.
+#
+# It is HOST-side: `gh` (TLS-validated) downloads the release assets HERE, and
+# this script streams them to the device with `ssh target 'cat > file'`. The
+# device's own `wget` does NOT validate TLS (the JetKVM build prints
+# "note: TLS certificate validation not implemented"), so an on-device download
+# would be MITM-exposed; the ssh pipe is the trusted channel.
+#
+# The device is a PHYSICAL, NON-DISPOSABLE appliance wired into a real machine's
+# keyboard/video/power. This tool therefore only READS the device it provisions:
+# it writes files under --prefix and nothing else. There is deliberately no MCP
+# server: `charly mcp serve` forked a full CLI model on a 199 MB / 1-core device
+# and exhausted memory during development; KVM control stays the host-side
+# `jetkvm:` verb, and the appliance only gets charly for its local project-less
+# verbs.
+set -eu
+
+PROG=charly-jetkvm
+RELEASE_REPO=opencharly/charly
+
+# Map a remote `uname -m` to the release artifact's arch suffix. The release
+# names its assets by suffix (`charly-linux-armv7`), so no GOARCH knowledge is
+# needed here — armv7 is already the artifact suffix the release builds.
+arch_suffix() {
+    case "$1" in
+        aarch64|arm64)      printf 'arm64\n' ;;
+        armv7l|armv7|armhf) printf 'armv7\n' ;;
+        x86_64|amd64)       printf 'amd64\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+die()  { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 1; }
+info() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+warn() { printf '%s: warning: %s\n' "$PROG" "$*" >&2; }
+
+usage() {
+    cat <<'EOF'
+Usage:
+  charly-jetkvm install   --host <ssh-target> [--version <CalVer>] [--prefix <path>]
+  charly-jetkvm status    --host <ssh-target> [--prefix <path>]
+  charly-jetkvm verify    --host <ssh-target> [--prefix <path>]
+  charly-jetkvm uninstall --host <ssh-target> [--prefix <path>] [--yes]
+
+Common flags:
+  --host <target>    ssh(1) destination (alias, or user@host[:port]). Required.
+  --version <CalVer> charly release to install, e.g. 2026.261.0108.
+                     Default: the newest published v* release.
+  --prefix <path>    install prefix ON THE DEVICE (default: /userdata/charly).
+  --arch <suffix>    override the auto-detected artifact arch
+                     (amd64|arm64|armv7). Default: derived from remote `uname -m`.
+  --ssh-arg <arg>    extra argument passed to every ssh(1) call (repeatable),
+                     e.g. --ssh-arg -i --ssh-arg ~/.ssh/jetkvm_ed25519
+                     --ssh-arg -p --ssh-arg 2222 . Use for identity files,
+                     non-default ports, ProxyJump, etc.
+  --min-free-mb <N>  refuse `install` if the device reports less MemAvailable
+                     than N MiB (default: 120). The device is small; an install
+                     into a thrashing system is how a prior attempt hung it.
+  --yes              do not prompt for the uninstall confirmation.
+
+Environment:
+  CHARLY_JETKVM_GH   gh(1) binary to use (default: gh).
+EOF
+}
+
+# --- argument parsing -------------------------------------------------------
+ACTION=
+HOST=
+VERSION=
+PREFIX=/userdata/charly
+ARCH=
+MIN_FREE_MB=120
+ASSUME_YES=0
+GH=${CHARLY_JETKVM_GH:-gh}
+SSH_ARG_LIST=$(mktemp "${TMPDIR:-/tmp}/charly-jetkvm.ssh.XXXXXX")
+trap 'rm -f "$SSH_ARG_LIST"' EXIT INT TERM
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+case "$1" in
+    -h|--help) usage; exit 0 ;;
+esac
+ACTION=$1; shift
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --host)        HOST=${2:?--host needs a value}; shift 2 ;;
+        --version)     VERSION=${2:?--version needs a value}; shift 2 ;;
+        --prefix)      PREFIX=${2:?--prefix needs a value}; shift 2 ;;
+        --arch)        ARCH=${2:?--arch needs a value}; shift 2 ;;
+        --ssh-arg)     printf '%s\n' "${2:?--ssh-arg needs a value}" >> "$SSH_ARG_LIST"; shift 2 ;;
+        --min-free-mb) MIN_FREE_MB=${2:?--min-free-mb needs a value}; shift 2 ;;
+        --yes)         ASSUME_YES=1; shift ;;
+        -h|--help)     usage; exit 0 ;;
+        *)             die "unknown argument: $1" ;;
+    esac
+done
+
+[ -n "$HOST" ] || die "--host is required"
+command -v "$GH" >/dev/null 2>&1 || die "$GH not found (needed to fetch release assets)"
+
+case "$ACTION" in
+    install|status|verify|uninstall) ;;
+    *) die "unknown action '$ACTION' (want install|status|verify|uninstall)" ;;
+esac
+
+# --- remote helpers ---------------------------------------------------------
+# Every remote command is a single `ssh` invocation; stdout is the remote's
+# stdout. Extra --ssh-arg values are read one-per-line from SSH_ARG_LIST and
+# passed BEFORE the host, so options like -i/-p/ProxyJump apply. POSIX sh has no
+# arrays, so the list is re-split on NEWLINES ONLY (IFS temporarily), which keeps
+# an identity-file path containing spaces intact.
+# shellcheck disable=SC2046
+rsh() {
+    if [ -s "$SSH_ARG_LIST" ]; then
+        _oldifs=$IFS
+        IFS='
+'
+        ssh $(cat "$SSH_ARG_LIST") "$HOST" "$@"
+        IFS=$_oldifs
+    else
+        ssh "$HOST" "$@"
+    fi
+}
+
+remote_arch() {
+    m=$(rsh 'uname -m' 2>/dev/null || true)
+    [ -n "$m" ] || die "cannot reach $HOST (ssh failed)"
+    arch_suffix "$m" || die "unsupported remote architecture: $m"
+}
+
+remote_avail_mb() {
+    rsh 'awk "/MemAvailable/{print int(\$2/1024)}" /proc/meminfo' 2>/dev/null || echo 0
+}
+
+resolve_version() {
+    [ -n "$VERSION" ] && { printf '%s\n' "$VERSION"; return 0; }
+    v=$("$GH" release view --repo "$RELEASE_REPO" --json tagName --jq '.tagName' 2>/dev/null \
+        | sed 's/^v//')
+    [ -n "$v" ] || die "could not resolve the latest release; pass --version"
+    printf '%s\n' "$v"
+}
+
+# --- install ----------------------------------------------------------------
+do_install() {
+    [ "$(rsh 'id -u' 2>/dev/null || echo x)" = "0" ] || die "install needs root on the device (use root@...)"
+    ver=$(resolve_version)
+    [ -n "$ARCH" ] || ARCH=$(remote_arch)
+    info "device arch=$ARCH, releasing charly $ver, prefix=$PREFIX"
+
+    avail=$(remote_avail_mb)
+    if [ "$avail" -lt "$MIN_FREE_MB" ]; then
+        die "device reports only ${avail} MiB MemAvailable (< ${MIN_FREE_MB}); refusing to install into a memory-starved system"
+    fi
+    info "device MemAvailable=${avail} MiB"
+
+    tag="v$ver"
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/charly-jetkvm.XXXXXX")
+    trap 'rm -rf "$tmp"' EXIT INT TERM
+
+    info "downloading release assets (host-side, TLS-validated)"
+    "$GH" release download "$tag" --repo "$RELEASE_REPO" \
+        --pattern "charly-linux-$ARCH" \
+        --pattern "charly-plugins-linux-$ARCH.tar.gz" \
+        --dir "$tmp" --clobber
+
+    bin="$tmp/charly-linux-$ARCH"
+    plugins="$tmp/charly-plugins-linux-$ARCH.tar.gz"
+    [ -s "$bin" ] || die "release asset charly-linux-$ARCH missing for $tag"
+    [ -s "$plugins" ] || die "release asset charly-plugins-linux-$ARCH.tar.gz missing for $tag"
+
+    info "preparing $PREFIX on the device"
+    rsh "rm -rf '$PREFIX' && mkdir -p '$PREFIX/plugins'"
+
+    info "streaming charly binary ($(wc -c < "$bin") bytes) over ssh"
+    rsh "cat > '$PREFIX/charly' && chmod 0755 '$PREFIX/charly'" < "$bin" \
+        || die "binary transfer failed"
+
+    info "streaming plugin set ($(wc -c < "$plugins") bytes) over ssh"
+    rsh "cat > '$PREFIX/plugins.tgz'" < "$plugins" || die "plugin transfer failed"
+    rsh "tar -xzf '$PREFIX/plugins.tgz' -C '$PREFIX/plugins' && rm -f '$PREFIX/plugins.tgz' && chmod 0755 '$PREFIX/plugins'/*" \
+        || die "plugin extraction failed on the device"
+
+    info "installed; run '$PROG verify --host $HOST' to prove it runs"
+}
+
+# --- verify -----------------------------------------------------------------
+# The device has no Go toolchain and no project, so the proof is the project-less
+# dispatch: `version` reports the stamped CalVer, `__plugin-providers`/`doctor`
+# resolve the baked plugins, and a baked command word dispatches.
+do_verify() {
+    ver=$(resolve_version)
+    [ -n "$ARCH" ] || ARCH=$(remote_arch)
+    info "verifying charly $ver ($ARCH) at $PREFIX on $HOST"
+
+    got=$(rsh "CHARLY_PLUGIN_DIR='$PREFIX/plugins' '$PREFIX/charly' version 2>/dev/null" || true)
+    [ "$got" = "$ver" ] || die "version mismatch: device reports '$got', expected '$ver'"
+    info "PASS version = $got"
+
+    nplugins=$(rsh "ls '$PREFIX/plugins'/*.providers 2>/dev/null | wc -l" || echo 0)
+    [ "$nplugins" -gt 0 ] || die "no .providers manifests under $PREFIX/plugins"
+    info "PASS $nplugins plugin manifests present"
+
+    # A baked plugin word must resolve project-less: `clean --help` dispatches
+    # the out-of-process command plugin (exit 0), which fails if the loader
+    # cannot connect the shared/baked plugin.
+    rsh "CHARLY_PLUGIN_DIR='$PREFIX/plugins' '$PREFIX/charly' clean --help >/dev/null 2>&1" \
+        || die "baked command 'clean' did not dispatch (plugin resolution failed)"
+    info "PASS baked command 'clean' dispatches project-less"
+
+    # doctor is a baked command plugin that runs regardless of container engine.
+    if rsh "CHARLY_PLUGIN_DIR='$PREFIX/plugins' '$PREFIX/charly' doctor >/dev/null 2>&1"; then
+        info "PASS 'doctor' ran"
+    else
+        warn "'doctor' returned non-zero (expected on an appliance with no container engine); plugin dispatch still proven above"
+    fi
+    info "verify: OK"
+}
+
+# --- status -----------------------------------------------------------------
+do_status() {
+    ver=$(resolve_version)
+    [ -n "$ARCH" ] || ARCH=$(remote_arch)
+    got=$(rsh "'$PREFIX/charly' version 2>/dev/null" || echo "<not installed>")
+    avail=$(remote_avail_mb)
+    printf 'host:      %s\n' "$HOST"
+    printf 'arch:      %s\n' "$ARCH"
+    printf 'prefix:    %s\n' "$PREFIX"
+    printf 'installed: %s\n' "$got"
+    printf 'expected:  %s\n' "$ver"
+    printf 'mem:       %s MiB available\n' "$avail"
+}
+
+# --- uninstall --------------------------------------------------------------
+do_uninstall() {
+    if [ "$ASSUME_YES" -ne 1 ]; then
+        printf 'Remove %s on %s? [y/N] ' "$PREFIX" "$HOST" >&2
+        read -r ans || ans=
+        case "$ans" in y|Y|yes|YES) ;; *) info "aborted"; return 0 ;; esac
+    fi
+    rsh "rm -rf '$PREFIX'" || die "removal failed"
+    info "removed $PREFIX on $HOST"
+}
+
+case "$ACTION" in
+    install)   do_install ;;
+    verify)    do_verify ;;
+    status)    do_status ;;
+    uninstall) do_uninstall ;;
+esac
