@@ -68,9 +68,21 @@ cp /authorized_keys /root/.ssh/authorized_keys
 chmod 700 /root/.ssh
 chmod 600 /root/.ssh/authorized_keys
 chown -R root:root /root/.ssh
+# Stand in for the appliance's kvm_config.json so `charly-jetkvm env` has a
+# token to derive (the real device ships this file at /userdata/kvm_config.json).
+mkdir -p /userdata
+cp /kvm_config.json /userdata/kvm_config.json
 exec /usr/sbin/sshd -D -e -p 2222
 ENTRY
 chmod +x "$TMP/entry.sh"
+
+cat > "$TMP/kvm_config.json" <<'KVM'
+{
+  "hashed_password": "$2a$10$example",
+  "local_auth_token": "test-token-0123456789abcdef",
+  "localAuthMode": "password"
+}
+KVM
 
 cat > "$TMP/sshconfig" <<EOF
 Host $HOST_ALIAS
@@ -85,6 +97,7 @@ EOF
 "$ENGINE" run -d --name "$CONTAINER" -p "$SSH_PORT:2222" \
     -v "$TMP/entry.sh:/entry.sh:ro" \
     -v "$TMP/authorized_keys:/authorized_keys:ro" \
+    -v "$TMP/kvm_config.json:/kvm_config.json:ro" \
     alpine:latest /entry.sh >/dev/null
 
 # readiness: bounded probe, no sleep-and-hope.
@@ -112,6 +125,24 @@ status_out="$("$INSTALLER" status --host "$HOST_ALIAS" "${SSHARGS[@]}" --prefix 
 echo "$status_out" | grep -q "installed: $VERSION" || {
     echo "bed: status did not report installed $VERSION:" >&2; echo "$status_out" >&2; exit 1; }
 echo "bed: PASS status"
+
+# --- 3b. `env` derives the device address + token from ssh alone ------------
+env_out="$("$INSTALLER" env --host "$HOST_ALIAS" "${SSHARGS[@]}")"
+echo "$env_out" | grep -q "^JETKVM_HOST=$HOST_ALIAS$" || {
+    echo "bed: env --host should default JETKVM_HOST to the ssh target ($HOST_ALIAS):" >&2; echo "$env_out" >&2; exit 1; }
+echo "$env_out" | grep -q "^JETKVM_AUTH_TOKEN=test-token-0123456789abcdef$" || {
+    echo "bed: env did not read local_auth_token from the device config:" >&2; echo "$env_out" >&2; exit 1; }
+# --export form must be eval-safe and yield the same two values.
+export_out="$("$INSTALLER" env --host "$HOST_ALIAS" "${SSHARGS[@]}" --export)"
+eval "$export_out"
+[ "$JETKVM_HOST" = "$HOST_ALIAS" ] && [ "$JETKVM_AUTH_TOKEN" = "test-token-0123456789abcdef" ] || {
+    echo "bed: env --export did not eval to the expected values:" >&2; echo "$export_out" >&2; exit 1; }
+unset JETKVM_HOST JETKVM_AUTH_TOKEN
+# --device-host overrides the printed host.
+"$INSTALLER" env --host "$HOST_ALIAS" "${SSHARGS[@]}" --device-host other.example \
+    | grep -q "^JETKVM_HOST=other.example$" || {
+    echo "bed: env --device-host did not override JETKVM_HOST" >&2; exit 1; }
+echo "bed: PASS env"
 
 # --- 4. verify FAILS after uninstall (negative control) ---------------------
 "$INSTALLER" uninstall --host "$HOST_ALIAS" "${SSHARGS[@]}" --prefix "$PREFIX" --yes

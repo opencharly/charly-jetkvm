@@ -16,6 +16,34 @@ charly-jetkvm status  --host root@jk.example.ts.net
 charly-jetkvm uninstall --host root@jk.example.ts.net
 ```
 
+## Drive the KVM from the ssh connection alone
+
+Everything to run a `jetkvm:` plan can be derived from the one ssh connection —
+no committed hostname and no hand-copied token. `charly-jetkvm env` reads the
+device's `local_auth_token` over ssh and prints the two environment variables the
+`jetkvm:` verb consumes (`JETKVM_HOST`, `JETKVM_AUTH_TOKEN`):
+
+```sh
+eval "$(charly-jetkvm env --host root@jk.example.ts.net --export)"
+charly check run jetkvm-device-readonly       # screenshot + status
+charly check run jetkvm-control-readonly-input  # screenshot → move → type → screenshot
+```
+
+The verb resolves the device address as authored `host:` → `JETKVM_HOST` → deploy
+venue, so a plan can author **no** device address and stay portable. Plain form:
+
+```sh
+charly-jetkvm env --host root@jk.example.ts.net
+# JETKVM_HOST=jk.example.ts.net
+# JETKVM_AUTH_TOKEN=<the device's local_auth_token>
+
+charly-jetkvm env --host root@jk.example.ts.net --device-host jk.tailnet.ts.net
+```
+
+`--device-host` overrides the printed `JETKVM_HOST` when the ssh target and the
+reachable device name differ. This tool never writes the token to a file; it
+only prints it, so the caller decides whether to export it.
+
 ## What it installs
 
 The release's `charly-linux-<arch>` binary plus `charly-plugins-linux-<arch>.tar.gz`
@@ -62,9 +90,13 @@ system is how a prior attempt hung it.
 | `--arch <suffix>` | override the auto-detected artifact arch (`amd64`/`arm64`/`armv7`). |
 | `--ssh-arg <arg>` | extra argument passed to every `ssh(1)` call (repeatable) — identity file, `-p`, `ProxyJump`, etc. |
 | `--min-free-mb <N>` | `install` refuses below this much device `MemAvailable` (default 120). |
+| `--device-host <name>` | (`env`) the `JETKVM_HOST` value to print; defaults to the ssh target's host part. |
+| `--export` | (`env`) print `export JETKVM_...=...` lines for `eval "$(...)"`. |
 | `--yes` | skip the `uninstall` confirmation prompt. |
 
 `CHARLY_JETKVM_GH` selects the `gh` binary (default `gh`).
+`CHARLY_JETKVM_CONFIG` selects the device config path (`env`; default
+`/userdata/kvm_config.json`).
 
 ### Identity file / non-default port
 
