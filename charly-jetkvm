@@ -300,6 +300,17 @@ do_uninstall() {
 #   read_local_token  -> local_auth_token ("" when unset/absent)
 #   read_auth_mode    -> localAuthMode ("password" | "noPassword" | "")
 #   app_present       -> 0 when a jetkvm_app process is running
+#
+# require_device_config FIRST distinguishes "cannot read the device config at
+# all" (unreachable host, non-JetKVM host, unreadable path) from a real
+# empty-token device. Without it a failed read would look exactly like a
+# legitimate noPassword device and both `env` and `auth` would silently
+# succeed on a host they never reached.
+require_device_config() {
+    rsh "test -r '$CONFIG_PATH'" \
+        || die "cannot read $CONFIG_PATH on $HOST (is it a JetKVM, and are you root?)"
+}
+
 read_local_token() {
     rsh "sed -n 's/.*\"local_auth_token\": *\"\\([^\"]*\\)\".*/\\1/p' '$CONFIG_PATH' 2>/dev/null" || true
 }
@@ -333,6 +344,7 @@ app_present() {
 # loads the config ONCE at start (config.LoadConfig) under a lock and does not
 # re-read on file change.
 ensure_auth_token() {
+    require_device_config
     tok=$(read_local_token)
     if [ -n "$tok" ]; then
         printf '%s\n' "$tok"
@@ -340,12 +352,23 @@ ensure_auth_token() {
     fi
 
     mode=$(read_auth_mode)
-    if [ "$mode" != "password" ]; then
-        # noPassword (or an unrecognized mode): an empty token is the correct
-        # state. Never mint here — that is the "never reset existing auth" rule.
-        printf '%s' ""
-        return 0
-    fi
+    case "$mode" in
+        noPassword)
+            # Empty is the correct state for a noPassword device. Never mint —
+            # that is the "never reset existing auth" rule.
+            printf '%s' ""
+            return 0
+            ;;
+        password)
+            : # the one state we heal
+            ;;
+        *)
+            # An unrecognized/empty mode after a SUCCESSFUL config read means the
+            # config is malformed, not that the device is tokenless-by-design.
+            # Minting here would be a guess; refuse and say so.
+            die "unrecognized localAuthMode '$mode' in $CONFIG_PATH on $HOST — refusing to mint"
+            ;;
+    esac
 
     # Mint a uuid on the DEVICE (busybox has no uuidgen dependency assumptions;
     # /proc/sys/kernel/random/uuid is always present on this kernel).
@@ -433,6 +456,9 @@ do_env() {
     fi
     [ -n "$dh" ] || die "cannot determine device host; pass --device-host"
 
+    # A failed read must be distinguishable from a legitimately tokenless
+    # device: require_device_config dies on an unreachable/non-JetKVM host.
+    require_device_config
     token=$(read_local_token)
     if [ -z "$token" ] && [ "$HEAL" -eq 1 ]; then
         # --heal: repair a password-mode device whose token was cleared. Minting
@@ -440,10 +466,18 @@ do_env() {
         token=$(ensure_auth_token) || exit 1
     fi
     if [ -z "$token" ]; then
-        if [ "$(read_auth_mode)" = "password" ]; then
-            die "device is password-mode with no local_auth_token (401s every request); rerun with --heal to mint one, or use 'charly-jetkvm auth'"
-        fi
-        # noPassword mode is legitimate: print the empty token as-is.
+        mode=$(read_auth_mode)
+        case "$mode" in
+            password)
+                die "device is password-mode with no local_auth_token (401s every request); rerun with --heal to mint one, or use 'charly-jetkvm auth'"
+                ;;
+            noPassword)
+                : # legitimate: print the empty token as-is
+                ;;
+            *)
+                die "unrecognized localAuthMode '$mode' in $CONFIG_PATH on $HOST"
+                ;;
+        esac
     fi
 
     if [ "$EXPORT" -eq 1 ]; then

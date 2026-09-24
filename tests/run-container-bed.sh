@@ -249,4 +249,31 @@ if "$INSTALLER" status --host 203.0.113.1 --ssh-arg -o --ssh-arg ConnectTimeout=
 fi
 echo "bed: PASS unreachable host errors cleanly"
 
+# --- 5b. env/auth must NOT swallow a failed config read ---------------------
+# An unreachable host must DIE, not print an empty token as if it were a
+# legitimate noPassword device. This is the exact confusion require_device_config
+# exists to prevent.
+if "$INSTALLER" env --host 203.0.113.1 --ssh-arg -o --ssh-arg ConnectTimeout=3 >/dev/null 2>&1; then
+    echo "bed: env printed a token for an UNREACHABLE host (must fail)" >&2
+    exit 1
+fi
+if "$INSTALLER" auth --host 203.0.113.1 --ssh-arg -o --ssh-arg ConnectTimeout=3 --print >/dev/null 2>&1; then
+    echo "bed: auth reported success for an UNREACHABLE host (must fail)" >&2
+    exit 1
+fi
+# A reachable host that is NOT a JetKVM (no kvm_config.json) must also fail, not
+# report an empty token. Stand one up: the same sshd container with the config
+# MOVED AWAY.
+if [ -n "$FAKE_APP" ]; then
+    ssh -F "$TMP/sshconfig" "$HOST_ALIAS" "mv /userdata/kvm_config.json /userdata/kvm_config.json.hidden"
+    if "$INSTALLER" env --host "$HOST_ALIAS" "${SSHARGS[@]}" >/dev/null 2>&1; then
+        echo "bed: env succeeded on a host with no kvm_config.json (must fail)" >&2; exit 1
+    fi
+    if "$INSTALLER" auth --host "$HOST_ALIAS" "${SSHARGS[@]}" --print >/dev/null 2>&1; then
+        echo "bed: auth succeeded on a host with no kvm_config.json (must fail)" >&2; exit 1
+    fi
+    ssh -F "$TMP/sshconfig" "$HOST_ALIAS" "mv /userdata/kvm_config.json.hidden /userdata/kvm_config.json"
+    echo "bed: PASS env/auth fail loudly when the device config is unreadable"
+fi
+
 echo "bed: ALL STEPS PASS (charly $VERSION)"
