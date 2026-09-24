@@ -91,9 +91,17 @@ cp /kvm_config.json /userdata/kvm_config.json
 if [ -s /fakeapp ]; then
     cp /fakeapp /userdata/jetkvm/bin/jetkvm_app
     chmod 0755 /userdata/jetkvm/bin/jetkvm_app
+fi
+# PID 1 must REAP the fake app: on the real device jetkvm_app's parent is init,
+# which reaps it on exit, so `pidof` goes empty and the restart's two-phase wait
+# proceeds. A raw `exec sshd` makes sshd PID 1, which does NOT reap an arbitrary
+# child — the killed fake app would linger as a zombie that `pidof` still lists.
+# So run sshd in the background and let this shell be PID 1, reaping via `wait`.
+/usr/sbin/sshd -e -p 2222
+if [ -s /fakeapp ]; then
     /userdata/jetkvm/bin/jetkvm_app &
 fi
-exec /usr/sbin/sshd -D -e -p 2222
+while :; do wait; done
 ENTRY
 chmod +x "$TMP/entry.sh"
 
@@ -205,6 +213,24 @@ ssh -F "$TMP/sshconfig" "$HOST_ALIAS" \
 ssh -F "$TMP/sshconfig" "$HOST_ALIAS" \
     "sed -i 's/\"local_auth_token\": *\"[^\"]*\"/\"local_auth_token\": \"test-token-0123456789abcdef\"/' /userdata/kvm_config.json"
 echo "bed: PASS auth never mints on a noPassword device"
+
+# (iv) `env` WITHOUT --heal on password+empty: must FAIL LOUDLY with the remedy.
+ssh -F "$TMP/sshconfig" "$HOST_ALIAS" \
+    "sed -i 's/\"local_auth_token\": *\"[^\"]*\"/\"local_auth_token\": \"\"/; s/\"localAuthMode\": *\"[^\"]*\"/\"localAuthMode\": \"password\"/' /userdata/kvm_config.json"
+if "$INSTALLER" env --host "$HOST_ALIAS" "${SSHARGS[@]}" >/dev/null 2>"$TMP/env-err"; then
+    echo "bed: env PASSED on password+empty without --heal; it must fail loudly" >&2; exit 1
+fi
+grep -q -- "--heal" "$TMP/env-err" || {
+    echo "bed: env's password+empty error does not name the --heal remedy:" >&2; cat "$TMP/env-err" >&2; exit 1; }
+
+# (v) `env --heal` on password+empty: mints and prints a NON-EMPTY token.
+heal_out="$("$INSTALLER" env --host "$HOST_ALIAS" "${SSHARGS[@]}" --heal)"
+echo "$heal_out" | grep -qE "^JETKVM_AUTH_TOKEN=.+$" || {
+    echo "bed: env --heal did not print a non-empty token:" >&2; echo "$heal_out" >&2; exit 1; }
+# and a second `env` WITHOUT --heal now succeeds (the token is present).
+"$INSTALLER" env --host "$HOST_ALIAS" "${SSHARGS[@]}" >/dev/null || {
+    echo "bed: env (no --heal) failed after a successful heal" >&2; exit 1; }
+echo "bed: PASS env --heal repairs and env without --heal fails loudly"
 
 fi  # end auth-restart assertions (FAKE_APP present)
 

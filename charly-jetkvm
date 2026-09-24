@@ -159,15 +159,21 @@ esac
 # an identity-file path containing spaces intact.
 # shellcheck disable=SC2046
 rsh() {
+    # Preserve ssh's EXIT STATUS, not the IFS restore's. The `IFS=$_oldifs`
+    # assignment would otherwise become the function's last command and force
+    # rc=0, so a remote command that FAILED (e.g. `pidof` finding nothing, or
+    # ssh itself erroring) would look like success to every caller.
+    rc=0
     if [ -s "$SSH_ARG_LIST" ]; then
         _oldifs=$IFS
         IFS='
 '
-        ssh $(cat "$SSH_ARG_LIST") "$HOST" "$@"
+        ssh $(cat "$SSH_ARG_LIST") "$HOST" "$@" || rc=$?
         IFS=$_oldifs
     else
-        ssh "$HOST" "$@"
+        ssh "$HOST" "$@" || rc=$?
     fi
+    return "$rc"
 }
 
 remote_arch() {
@@ -365,17 +371,33 @@ ensure_auth_token() {
     # upstream's own e2e helper uses. LD_LIBRARY_PATH is required for the vendor
     # libs under /oem/usr/lib. setsid detaches it from the ssh session so the
     # app outlives this connection.
-    rsh "killall jetkvm_app 2>/dev/null; sleep 1; \
-         setsid env LD_LIBRARY_PATH=/oem/usr/lib /userdata/jetkvm/bin/jetkvm_app >/userdata/jetkvm/last.log 2>&1 &" \
-        || die "could not restart jetkvm_app on $HOST"
-
-    # Readiness: bounded poll for the app to come back, never a sleep-and-hope.
-    ready=0
+    #
+    # Readiness is a real TWO-PHASE condition wait, not a blind sleep:
+    #   1. bounded poll until the OLD pid is gone (kill is asynchronous);
+    #   2. respawn;
+    #   3. bounded poll until a NEW pid appears.
+    # A single `sleep 1` before the respawn races the old process's death, and
+    # a bare `pidof` poll can then be satisfied by the not-yet-dead OLD process
+    # — reporting success without the new app ever coming up.
+    old_pid=$(rsh "pidof jetkvm_app 2>/dev/null" 2>/dev/null | tr -d '\r\n')
+    rsh "killall jetkvm_app 2>/dev/null || true" || true
+    gone=0
     for _ in $(seq 1 30); do
-        if app_present; then ready=1; break; fi
+        if ! app_present; then gone=1; break; fi
         sleep 1
     done
-    [ "$ready" -eq 1 ] || die "jetkvm_app did not come back after the restart on $HOST"
+    [ "$gone" -eq 1 ] || die "jetkvm_app did not stop within 30s on $HOST"
+
+    rsh "setsid env LD_LIBRARY_PATH=/oem/usr/lib /userdata/jetkvm/bin/jetkvm_app >/userdata/jetkvm/last.log 2>&1 &" \
+        || die "could not restart jetkvm_app on $HOST"
+
+    ready=0
+    for _ in $(seq 1 30); do
+        new_pid=$(rsh "pidof jetkvm_app 2>/dev/null" 2>/dev/null | tr -d '\r\n')
+        if [ -n "$new_pid" ] && [ "$new_pid" != "$old_pid" ]; then ready=1; break; fi
+        sleep 1
+    done
+    [ "$ready" -eq 1 ] || die "jetkvm_app did not come back as a NEW process after the restart on $HOST"
 
     printf '%s\n' "$new_uuid"
 }
