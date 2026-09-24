@@ -44,6 +44,37 @@ charly-jetkvm env --host root@jk.example.ts.net --device-host jk.tailnet.ts.net
 reachable device name differ. This tool never writes the token to a file; it
 only prints it, so the caller decides whether to export it.
 
+## Repair a device with no auth token
+
+Upstream JetKVM mints `local_auth_token` **only** inside a successful
+login/setup handler (`config.LocalAuthToken = uuid.New()`), and never re-mints it
+at startup. A device in `password` mode whose token was cleared — a logout, a
+config reset, a crash before `SaveConfig` — therefore answers **HTTP 401** to
+every authenticated request, with no way back without the password.
+
+`charly-jetkvm auth` repairs exactly that state: it writes a fresh uuid into
+`local_auth_token` and restarts `jetkvm_app` (the same `killall` + respawn
+upstream's own e2e helper uses). It obeys one rule — **add only what is missing,
+never reset existing auth**:
+
+- a **non-empty** token is returned **untouched** (an existing live session is
+  never invalidated);
+- a device in **`noPassword`** mode legitimately has an empty token and is
+  **never** minted into (that would silently start demanding auth);
+- **`password` mode with an empty token** is the one state healed.
+
+```sh
+# repair, then print the repaired environment in one step:
+eval "$(charly-jetkvm env --host root@jk.example.ts.net --export --heal)"
+
+# or inspect/repair the token alone:
+charly-jetkvm auth --host root@jk.example.ts.net           # prints JETKVM_AUTH_TOKEN=…
+charly-jetkvm auth --host root@jk.example.ts.net --print   # the bare token
+```
+
+`env` **without** `--heal` fails loudly when a password-mode device has no token
+(telling you to rerun with `--heal`) rather than printing a 401-bound empty one.
+
 ## What it installs
 
 The release's `charly-linux-<arch>` binary plus `charly-plugins-linux-<arch>.tar.gz`
@@ -92,6 +123,8 @@ system is how a prior attempt hung it.
 | `--min-free-mb <N>` | `install` refuses below this much device `MemAvailable` (default 120). |
 | `--device-host <name>` | (`env`) the `JETKVM_HOST` value to print; defaults to the ssh target's host part. |
 | `--export` | (`env`) print `export JETKVM_...=...` lines for `eval "$(...)"`. |
+| `--heal` | (`env`) mint a missing token first (password mode only); never overwrites an existing one. |
+| `--print` | (`auth`) print the bare token instead of `JETKVM_AUTH_TOKEN=…`. |
 | `--yes` | skip the `uninstall` confirmation prompt. |
 
 `CHARLY_JETKVM_GH` selects the `gh` binary (default `gh`).
