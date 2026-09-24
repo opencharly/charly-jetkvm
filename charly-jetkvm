@@ -52,7 +52,8 @@ Usage:
   charly-jetkvm status    --host <ssh-target> [--prefix <path>]
   charly-jetkvm verify    --host <ssh-target> [--prefix <path>]
   charly-jetkvm uninstall --host <ssh-target> [--prefix <path>] [--yes]
-  charly-jetkvm env       --host <ssh-target> [--export] [--device-host <name>]
+  charly-jetkvm env       --host <ssh-target> [--export] [--device-host <name>] [--heal]
+  charly-jetkvm auth      --host <ssh-target> [--print]
 
 Common flags:
   --host <target>    ssh(1) destination (alias, or user@host[:port]). Required.
@@ -83,6 +84,18 @@ connection alone with no committed hostname or token:
   eval "$(charly-jetkvm env --host root@jk.example.ts.net --export)"
   charly check run jetkvm-device-readonly
 
+`env --heal` / `auth` repair a device whose local_auth_token is EMPTY. Upstream
+JetKVM mints the token ONLY on a successful login/setup and never re-mints it at
+startup, so a password-mode device whose token was cleared (logout, a config
+reset, a crash before save) answers HTTP 401 to every authenticated request with
+no way back without the password. `auth` writes a fresh uuid into
+`local_auth_token` and restarts the app — ONLY when the field is empty, NEVER
+overwriting a non-empty token (so an existing live session is never broken).
+`env --heal` does the same, then prints the environment.
+
+This is JetKVM's OWN recovery shape (upstream ui/e2e/helpers/ssh.ts
+restartAppViaSSH: `killall jetkvm_app` + respawn with LD_LIBRARY_PATH).
+
 Environment:
   CHARLY_JETKVM_GH   gh(1) binary to use (default: gh).
   CHARLY_JETKVM_CONFIG  device config path (default /userdata/kvm_config.json).
@@ -99,6 +112,8 @@ MIN_FREE_MB=120
 ASSUME_YES=0
 DEVICE_HOST=
 EXPORT=0
+HEAL=0
+PRINT_ONLY=0
 GH=${CHARLY_JETKVM_GH:-gh}
 CONFIG_PATH=${CHARLY_JETKVM_CONFIG:-/userdata/kvm_config.json}
 SSH_ARG_LIST=$(mktemp "${TMPDIR:-/tmp}/charly-jetkvm.ssh.XXXXXX")
@@ -120,6 +135,8 @@ while [ $# -gt 0 ]; do
         --min-free-mb) MIN_FREE_MB=${2:?--min-free-mb needs a value}; shift 2 ;;
         --device-host) DEVICE_HOST=${2:?--device-host needs a value}; shift 2 ;;
         --export)      EXPORT=1; shift ;;
+        --heal)        HEAL=1; shift ;;
+        --print)       PRINT_ONLY=1; shift ;;
         --yes)         ASSUME_YES=1; shift ;;
         -h|--help)     usage; exit 0 ;;
         *)             die "unknown argument: $1" ;;
@@ -130,8 +147,8 @@ done
 command -v "$GH" >/dev/null 2>&1 || die "$GH not found (needed to fetch release assets)"
 
 case "$ACTION" in
-    install|status|verify|uninstall|env) ;;
-    *) die "unknown action '$ACTION' (want install|status|verify|uninstall|env)" ;;
+    install|status|verify|uninstall|env|auth) ;;
+    *) die "unknown action '$ACTION' (want install|status|verify|uninstall|env|auth)" ;;
 esac
 
 # --- remote helpers ---------------------------------------------------------
@@ -142,15 +159,21 @@ esac
 # an identity-file path containing spaces intact.
 # shellcheck disable=SC2046
 rsh() {
+    # Preserve ssh's EXIT STATUS, not the IFS restore's. The `IFS=$_oldifs`
+    # assignment would otherwise become the function's last command and force
+    # rc=0, so a remote command that FAILED (e.g. `pidof` finding nothing, or
+    # ssh itself erroring) would look like success to every caller.
+    rc=0
     if [ -s "$SSH_ARG_LIST" ]; then
         _oldifs=$IFS
         IFS='
 '
-        ssh $(cat "$SSH_ARG_LIST") "$HOST" "$@"
+        ssh $(cat "$SSH_ARG_LIST") "$HOST" "$@" || rc=$?
         IFS=$_oldifs
     else
-        ssh "$HOST" "$@"
+        ssh "$HOST" "$@" || rc=$?
     fi
+    return "$rc"
 }
 
 remote_arch() {
@@ -272,6 +295,151 @@ do_uninstall() {
     info "removed $PREFIX on $HOST"
 }
 
+# --- auth self-heal ---------------------------------------------------------
+# The device's auth state, read OVER SSH from kvm_config.json:
+#   read_local_token  -> local_auth_token ("" when unset/absent)
+#   read_auth_mode    -> localAuthMode ("password" | "noPassword" | "")
+#   app_present       -> 0 when a jetkvm_app process is running
+#
+# require_device_config FIRST distinguishes "cannot read the device config at
+# all" (unreachable host, non-JetKVM host, unreadable path) from a real
+# empty-token device. Without it a failed read would look exactly like a
+# legitimate noPassword device and both `env` and `auth` would silently
+# succeed on a host they never reached.
+require_device_config() {
+    rsh "test -r '$CONFIG_PATH'" \
+        || die "cannot read $CONFIG_PATH on $HOST (is it a JetKVM, and are you root?)"
+}
+
+read_local_token() {
+    rsh "sed -n 's/.*\"local_auth_token\": *\"\\([^\"]*\\)\".*/\\1/p' '$CONFIG_PATH' 2>/dev/null" || true
+}
+
+read_auth_mode() {
+    rsh "sed -n 's/.*\"localAuthMode\": *\"\\([^\"]*\\)\".*/\\1/p' '$CONFIG_PATH' 2>/dev/null" || true
+}
+
+app_present() {
+    rsh "pidof jetkvm_app >/dev/null 2>&1" 2>/dev/null
+}
+
+# ensure_auth_token guarantees a usable token, MINTING ONE ONLY WHEN MISSING.
+#
+# Upstream JetKVM mints LocalAuthToken (= uuid.New()) ONLY inside a successful
+# login/setup handler and never at startup, so a device in password mode whose
+# token was cleared (logout, a config reset, a crash before save) answers 401 to
+# every authenticated request with no way back without the password. We repair
+# that by writing a fresh uuid into local_auth_token and restarting the app.
+#
+# THE PRIME DIRECTIVE — add ONLY what is missing, never reset existing auth:
+#   * a non-empty token is returned UNTOUCHED (an existing live session is
+#     never invalidated);
+#   * a device in `noPassword` mode legitimately has an EMPTY token and is
+#     NEVER minted into — doing so would silently switch it toward requiring
+#     auth. It is reported as an empty token, and the plugin path (which treats
+#     an empty token as the noPassword case) is correct as-is;
+#   * `password` mode with an empty token is the ONE state we heal.
+#
+# It echoes the (possibly empty) token. Restart is required because the app
+# loads the config ONCE at start (config.LoadConfig) under a lock and does not
+# re-read on file change.
+ensure_auth_token() {
+    require_device_config
+    tok=$(read_local_token)
+    if [ -n "$tok" ]; then
+        printf '%s\n' "$tok"
+        return 0
+    fi
+
+    mode=$(read_auth_mode)
+    case "$mode" in
+        noPassword)
+            # Empty is the correct state for a noPassword device. Never mint —
+            # that is the "never reset existing auth" rule.
+            printf '%s' ""
+            return 0
+            ;;
+        password)
+            : # the one state we heal
+            ;;
+        *)
+            # An unrecognized/empty mode after a SUCCESSFUL config read means the
+            # config is malformed, not that the device is tokenless-by-design.
+            # Minting here would be a guess; refuse and say so.
+            die "unrecognized localAuthMode '$mode' in $CONFIG_PATH on $HOST — refusing to mint"
+            ;;
+    esac
+
+    # Mint a uuid on the DEVICE (busybox has no uuidgen dependency assumptions;
+    # /proc/sys/kernel/random/uuid is always present on this kernel).
+    info "password-mode device has no local_auth_token; minting one (existing auth is never overwritten)"
+    new_uuid=$(rsh "cat /proc/sys/kernel/random/uuid" 2>/dev/null | tr -d '\r\n')
+    case "$new_uuid" in
+        ????????-????-????-????-????????????) ;;
+        *) die "could not mint a uuid on the device (got '$new_uuid')" ;;
+    esac
+
+    # Guard the write: rewrite the token ONLY when the field is present and
+    # EMPTY. The grep makes a missing key a hard error instead of a silent
+    # no-op sed, and the re-read below verifies the write actually took.
+    rsh "grep -q '\"local_auth_token\": *\"\"' '$CONFIG_PATH' && \
+         sed -i 's/\"local_auth_token\": *\"\"/\"local_auth_token\": \"$new_uuid\"/' '$CONFIG_PATH'" \
+        || die "could not write the minted token to $CONFIG_PATH on $HOST (does the field exist?)"
+
+    got=$(read_local_token)
+    [ "$got" = "$new_uuid" ] || die "token write did not take: expected '$new_uuid', read '$got'"
+
+    info "restarting jetkvm_app so it loads the minted token (killall + respawn, upstream's own recovery shape)"
+    # The app is the ONLY writer of this config; restart is the exact recovery
+    # upstream's own e2e helper uses. LD_LIBRARY_PATH is required for the vendor
+    # libs under /oem/usr/lib. setsid detaches it from the ssh session so the
+    # app outlives this connection.
+    #
+    # Readiness is a real TWO-PHASE condition wait, not a blind sleep:
+    #   1. bounded poll until the OLD pid is gone (kill is asynchronous);
+    #   2. respawn;
+    #   3. bounded poll until a NEW pid appears.
+    # A single `sleep 1` before the respawn races the old process's death, and
+    # a bare `pidof` poll can then be satisfied by the not-yet-dead OLD process
+    # — reporting success without the new app ever coming up.
+    old_pid=$(rsh "pidof jetkvm_app 2>/dev/null" 2>/dev/null | tr -d '\r\n')
+    rsh "killall jetkvm_app 2>/dev/null || true" || true
+    gone=0
+    for _ in $(seq 1 30); do
+        if ! app_present; then gone=1; break; fi
+        sleep 1
+    done
+    [ "$gone" -eq 1 ] || die "jetkvm_app did not stop within 30s on $HOST"
+
+    rsh "setsid env LD_LIBRARY_PATH=/oem/usr/lib /userdata/jetkvm/bin/jetkvm_app >/userdata/jetkvm/last.log 2>&1 &" \
+        || die "could not restart jetkvm_app on $HOST"
+
+    ready=0
+    for _ in $(seq 1 30); do
+        new_pid=$(rsh "pidof jetkvm_app 2>/dev/null" 2>/dev/null | tr -d '\r\n')
+        if [ -n "$new_pid" ] && [ "$new_pid" != "$old_pid" ]; then ready=1; break; fi
+        sleep 1
+    done
+    [ "$ready" -eq 1 ] || die "jetkvm_app did not come back as a NEW process after the restart on $HOST"
+
+    printf '%s\n' "$new_uuid"
+}
+
+# --- auth -------------------------------------------------------------------
+# `auth` ensures a token exists (minting only if missing) and reports it.
+do_auth() {
+    got=$(ensure_auth_token) || exit 1
+    if [ "$PRINT_ONLY" -eq 1 ]; then
+        printf '%s\n' "$got"
+    elif [ -n "$got" ]; then
+        info "device auth token is present (minted only if it was missing)"
+        printf 'JETKVM_AUTH_TOKEN=%s\n' "$got"
+    else
+        info "device is in noPassword mode (empty token); nothing to mint"
+        printf 'JETKVM_AUTH_TOKEN=\n'
+    fi
+}
+
 # --- env --------------------------------------------------------------------
 # Prints JETKVM_HOST + JETKVM_AUTH_TOKEN derived from the device OVER SSH, so a
 # `jetkvm:` plan can be driven from the ssh connection ALONE — no committed
@@ -288,8 +456,29 @@ do_env() {
     fi
     [ -n "$dh" ] || die "cannot determine device host; pass --device-host"
 
-    token=$(rsh "sed -n 's/.*\"local_auth_token\": *\"\\([^\"]*\\)\".*/\\1/p' '$CONFIG_PATH' 2>/dev/null" || true)
-    [ -n "$token" ] || die "could not read local_auth_token from $CONFIG_PATH on $HOST (is it a JetKVM, and are you root?)"
+    # A failed read must be distinguishable from a legitimately tokenless
+    # device: require_device_config dies on an unreachable/non-JetKVM host.
+    require_device_config
+    token=$(read_local_token)
+    if [ -z "$token" ] && [ "$HEAL" -eq 1 ]; then
+        # --heal: repair a password-mode device whose token was cleared. Minting
+        # is a no-op on a noPassword device (empty is its correct state).
+        token=$(ensure_auth_token) || exit 1
+    fi
+    if [ -z "$token" ]; then
+        mode=$(read_auth_mode)
+        case "$mode" in
+            password)
+                die "device is password-mode with no local_auth_token (401s every request); rerun with --heal to mint one, or use 'charly-jetkvm auth'"
+                ;;
+            noPassword)
+                : # legitimate: print the empty token as-is
+                ;;
+            *)
+                die "unrecognized localAuthMode '$mode' in $CONFIG_PATH on $HOST"
+                ;;
+        esac
+    fi
 
     if [ "$EXPORT" -eq 1 ]; then
         printf 'export JETKVM_HOST=%s\n' "$(shquote "$dh")"
@@ -311,4 +500,5 @@ case "$ACTION" in
     status)    do_status ;;
     uninstall) do_uninstall ;;
     env)       do_env ;;
+    auth)      do_auth ;;
 esac

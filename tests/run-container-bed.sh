@@ -58,6 +58,22 @@ echo "bed: charly $VERSION via $ENGINE (ssh port $SSH_PORT)"
 ssh-keygen -q -t ed25519 -N "" -f "$TMP/id"
 cp "$TMP/id.pub" "$TMP/authorized_keys"
 
+# Stand in for the jetkvm_app the auth self-heal restarts + waits on. The
+# restart in charly-jetkvm invokes the REAL device path with NO ARGS (and
+# LD_LIBRARY_PATH), so the fake must be an ELF that blocks on a bare
+# invocation, and `pidof jetkvm_app` must see its comm (the executable's
+# basename). A shell script cannot: the kernel sets comm to the interpreter.
+# Compile a 2-line sleeper here and bind-mount it in.
+FAKE_APP=""
+if command -v cc >/dev/null 2>&1; then
+    cat > "$TMP/fakeapp.c" <<'C'
+#include <unistd.h>
+int main(void){ for(;;) sleep(3600); return 0; }
+C
+    cc -static -O2 -o "$TMP/jetkvm_app" "$TMP/fakeapp.c" 2>/dev/null || FAKE_APP=""
+    [ -s "$TMP/jetkvm_app" ] && FAKE_APP="$TMP/jetkvm_app"
+fi
+
 cat > "$TMP/entry.sh" <<'ENTRY'
 #!/bin/sh
 set -e
@@ -70,9 +86,22 @@ chmod 600 /root/.ssh/authorized_keys
 chown -R root:root /root/.ssh
 # Stand in for the appliance's kvm_config.json so `charly-jetkvm env` has a
 # token to derive (the real device ships this file at /userdata/kvm_config.json).
-mkdir -p /userdata
+mkdir -p /userdata /userdata/jetkvm/bin /oem/usr/lib
 cp /kvm_config.json /userdata/kvm_config.json
-exec /usr/sbin/sshd -D -e -p 2222
+if [ -s /fakeapp ]; then
+    cp /fakeapp /userdata/jetkvm/bin/jetkvm_app
+    chmod 0755 /userdata/jetkvm/bin/jetkvm_app
+fi
+# PID 1 must REAP the fake app: on the real device jetkvm_app's parent is init,
+# which reaps it on exit, so `pidof` goes empty and the restart's two-phase wait
+# proceeds. A raw `exec sshd` makes sshd PID 1, which does NOT reap an arbitrary
+# child — the killed fake app would linger as a zombie that `pidof` still lists.
+# So run sshd in the background and let this shell be PID 1, reaping via `wait`.
+/usr/sbin/sshd -e -p 2222
+if [ -s /fakeapp ]; then
+    /userdata/jetkvm/bin/jetkvm_app &
+fi
+while :; do wait; done
 ENTRY
 chmod +x "$TMP/entry.sh"
 
@@ -98,6 +127,7 @@ EOF
     -v "$TMP/entry.sh:/entry.sh:ro" \
     -v "$TMP/authorized_keys:/authorized_keys:ro" \
     -v "$TMP/kvm_config.json:/kvm_config.json:ro" \
+    ${FAKE_APP:+-v "$FAKE_APP:/fakeapp:ro"} \
     alpine:latest /entry.sh >/dev/null
 
 # readiness: bounded probe, no sleep-and-hope.
@@ -144,6 +174,66 @@ unset JETKVM_HOST JETKVM_AUTH_TOKEN
     echo "bed: env --device-host did not override JETKVM_HOST" >&2; exit 1; }
 echo "bed: PASS env"
 
+# --- 3c. auth self-heal: mint ONLY when missing, NEVER overwrite -------------
+if [ -z "$FAKE_APP" ]; then
+    echo "bed: SKIP auth-restart assertions (no C compiler to build the fake jetkvm_app)"
+else
+
+# (i) a NON-EMPTY token is returned untouched by `auth` — no restart side effect.
+auth_out="$("$INSTALLER" auth --host "$HOST_ALIAS" "${SSHARGS[@]}")"
+echo "$auth_out" | grep -q "^JETKVM_AUTH_TOKEN=test-token-0123456789abcdef$" || {
+    echo "bed: auth did not return the existing token unchanged:" >&2; echo "$auth_out" >&2; exit 1; }
+
+# (ii) password mode with an EMPTY token: `auth` mints one and it is written.
+ssh -F "$TMP/sshconfig" "$HOST_ALIAS" \
+    "sed -i 's/\"local_auth_token\": *\"[^\"]*\"/\"local_auth_token\": \"\"/' /userdata/kvm_config.json"
+before="$(ssh -F "$TMP/sshconfig" "$HOST_ALIAS" "sed -n 's/.*\"local_auth_token\": *\"\\([^\"]*\\)\".*/\\1/p' /userdata/kvm_config.json")"
+[ -z "$before" ] || { echo "bed: could not clear the token for the heal case" >&2; exit 1; }
+minted="$("$INSTALLER" auth --host "$HOST_ALIAS" "${SSHARGS[@]}" --print)"
+case "$minted" in
+    ????????-????-????-????-????????????) ;;
+    *) echo "bed: auth --print did not mint a uuid (got '$minted')" >&2; exit 1 ;;
+esac
+after="$(ssh -F "$TMP/sshconfig" "$HOST_ALIAS" "sed -n 's/.*\"local_auth_token\": *\"\\([^\"]*\\)\".*/\\1/p' /userdata/kvm_config.json")"
+[ "$after" = "$minted" ] || { echo "bed: minted token was not written to the config (want '$minted', read '$after')" >&2; exit 1; }
+pid="$(ssh -F "$TMP/sshconfig" "$HOST_ALIAS" "pidof jetkvm_app" || true)"
+[ -n "$pid" ] || { echo "bed: jetkvm_app did not come back after the heal restart" >&2; exit 1; }
+echo "bed: PASS auth mints only when missing"
+
+# (iii) noPassword mode with an EMPTY token: NEVER minted (empty is correct).
+ssh -F "$TMP/sshconfig" "$HOST_ALIAS" \
+    "sed -i 's/\"local_auth_token\": *\"[^\"]*\"/\"local_auth_token\": \"\"/; s/\"localAuthMode\": *\"[^\"]*\"/\"localAuthMode\": \"noPassword\"/' /userdata/kvm_config.json"
+np="$("$INSTALLER" auth --host "$HOST_ALIAS" "${SSHARGS[@]}" --print)"
+[ -z "$np" ] || { echo "bed: auth MINTED a token on a noPassword device (must not): '$np'" >&2; exit 1; }
+np_after="$(ssh -F "$TMP/sshconfig" "$HOST_ALIAS" "sed -n 's/.*\"local_auth_token\": *\"\\([^\"]*\\)\".*/\\1/p' /userdata/kvm_config.json")"
+[ -z "$np_after" ] || { echo "bed: noPassword device's token was written (must stay empty)" >&2; exit 1; }
+# restore the fixture for the remaining steps.
+ssh -F "$TMP/sshconfig" "$HOST_ALIAS" \
+    "sed -i 's/\"localAuthMode\": *\"[^\"]*\"/\"localAuthMode\": \"password\"/' /userdata/kvm_config.json"
+ssh -F "$TMP/sshconfig" "$HOST_ALIAS" \
+    "sed -i 's/\"local_auth_token\": *\"[^\"]*\"/\"local_auth_token\": \"test-token-0123456789abcdef\"/' /userdata/kvm_config.json"
+echo "bed: PASS auth never mints on a noPassword device"
+
+# (iv) `env` WITHOUT --heal on password+empty: must FAIL LOUDLY with the remedy.
+ssh -F "$TMP/sshconfig" "$HOST_ALIAS" \
+    "sed -i 's/\"local_auth_token\": *\"[^\"]*\"/\"local_auth_token\": \"\"/; s/\"localAuthMode\": *\"[^\"]*\"/\"localAuthMode\": \"password\"/' /userdata/kvm_config.json"
+if "$INSTALLER" env --host "$HOST_ALIAS" "${SSHARGS[@]}" >/dev/null 2>"$TMP/env-err"; then
+    echo "bed: env PASSED on password+empty without --heal; it must fail loudly" >&2; exit 1
+fi
+grep -q -- "--heal" "$TMP/env-err" || {
+    echo "bed: env's password+empty error does not name the --heal remedy:" >&2; cat "$TMP/env-err" >&2; exit 1; }
+
+# (v) `env --heal` on password+empty: mints and prints a NON-EMPTY token.
+heal_out="$("$INSTALLER" env --host "$HOST_ALIAS" "${SSHARGS[@]}" --heal)"
+echo "$heal_out" | grep -qE "^JETKVM_AUTH_TOKEN=.+$" || {
+    echo "bed: env --heal did not print a non-empty token:" >&2; echo "$heal_out" >&2; exit 1; }
+# and a second `env` WITHOUT --heal now succeeds (the token is present).
+"$INSTALLER" env --host "$HOST_ALIAS" "${SSHARGS[@]}" >/dev/null || {
+    echo "bed: env (no --heal) failed after a successful heal" >&2; exit 1; }
+echo "bed: PASS env --heal repairs and env without --heal fails loudly"
+
+fi  # end auth-restart assertions (FAKE_APP present)
+
 # --- 4. verify FAILS after uninstall (negative control) ---------------------
 "$INSTALLER" uninstall --host "$HOST_ALIAS" "${SSHARGS[@]}" --prefix "$PREFIX" --yes
 if "$INSTALLER" verify --host "$HOST_ALIAS" "${SSHARGS[@]}" --version "$VERSION" --prefix "$PREFIX" >/dev/null 2>&1; then
@@ -158,5 +248,32 @@ if "$INSTALLER" status --host 203.0.113.1 --ssh-arg -o --ssh-arg ConnectTimeout=
     exit 1
 fi
 echo "bed: PASS unreachable host errors cleanly"
+
+# --- 5b. env/auth must NOT swallow a failed config read ---------------------
+# An unreachable host must DIE, not print an empty token as if it were a
+# legitimate noPassword device. This is the exact confusion require_device_config
+# exists to prevent.
+if "$INSTALLER" env --host 203.0.113.1 --ssh-arg -o --ssh-arg ConnectTimeout=3 >/dev/null 2>&1; then
+    echo "bed: env printed a token for an UNREACHABLE host (must fail)" >&2
+    exit 1
+fi
+if "$INSTALLER" auth --host 203.0.113.1 --ssh-arg -o --ssh-arg ConnectTimeout=3 --print >/dev/null 2>&1; then
+    echo "bed: auth reported success for an UNREACHABLE host (must fail)" >&2
+    exit 1
+fi
+# A reachable host that is NOT a JetKVM (no kvm_config.json) must also fail, not
+# report an empty token. Stand one up: the same sshd container with the config
+# MOVED AWAY.
+if [ -n "$FAKE_APP" ]; then
+    ssh -F "$TMP/sshconfig" "$HOST_ALIAS" "mv /userdata/kvm_config.json /userdata/kvm_config.json.hidden"
+    if "$INSTALLER" env --host "$HOST_ALIAS" "${SSHARGS[@]}" >/dev/null 2>&1; then
+        echo "bed: env succeeded on a host with no kvm_config.json (must fail)" >&2; exit 1
+    fi
+    if "$INSTALLER" auth --host "$HOST_ALIAS" "${SSHARGS[@]}" --print >/dev/null 2>&1; then
+        echo "bed: auth succeeded on a host with no kvm_config.json (must fail)" >&2; exit 1
+    fi
+    ssh -F "$TMP/sshconfig" "$HOST_ALIAS" "mv /userdata/kvm_config.json.hidden /userdata/kvm_config.json"
+    echo "bed: PASS env/auth fail loudly when the device config is unreadable"
+fi
 
 echo "bed: ALL STEPS PASS (charly $VERSION)"
